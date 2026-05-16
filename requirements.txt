@@ -1,0 +1,5 @@
+strands-agents
+strands-agents-tools
+strands-agents-bedrock
+fastapi
+uvicorn[standard]

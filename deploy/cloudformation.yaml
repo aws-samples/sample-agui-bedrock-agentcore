@@ -18,6 +18,12 @@ Parameters:
     Description: >
       IPv4 CIDR to allow access (e.g. 203.0.113.50/32 for a single IP).
       Default 0.0.0.0/0 allows all traffic — tighten this to your own IP for security.
+  ProxyAssetBucketParam:
+    Type: String
+    Description: S3 bucket containing the zipped proxy Lambda code
+  ProxyAssetKeyParam:
+    Type: String
+    Description: S3 key (within ProxyAssetBucketParam) of the proxy zip
 
 Resources:
 
@@ -178,7 +184,7 @@ Resources:
     DependsOn: ProxyLambdaInvokePolicy
     Properties:
       FunctionName: !Sub '${EnvironmentName}-proxy'
-      Runtime: python3.12
+      Runtime: nodejs20.x
       Handler: index.handler
       Timeout: 120
       MemorySize: 256
@@ -191,112 +197,45 @@ Resources:
           AGENT_RUNTIME_ARN: !Ref AgentRuntimeArn
           REGION: !Ref 'AWS::Region'
       Code:
-        ZipFile: |
-          import json, os, boto3
+        S3Bucket: !Ref ProxyAssetBucketParam
+        S3Key: !Ref ProxyAssetKeyParam
 
-          def handler(event, context):
-              agent_arn = os.environ.get('AGENT_RUNTIME_ARN', '')
-              region = os.environ.get('REGION', 'us-west-2')
-
-              # Parse request
-              body = json.loads(event.get('body', '{}'))
-              prompt = body.get('message', body.get('prompt', ''))
-
-              if not agent_arn or agent_arn == 'NONE':
-                  return {
-                      'statusCode': 500,
-                      'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
-                      'body': json.dumps({'error': 'AGENT_RUNTIME_ARN not configured. Update the CloudFormation stack with the agent ARN.'})
-                  }
-
-              client = boto3.client('bedrock-agentcore', region_name=region)
-
-              try:
-                  response = client.invoke_agent_runtime(
-                      agentRuntimeArn=agent_arn,
-                      qualifier='DEFAULT',
-                      payload=json.dumps({'prompt': prompt})
-                  )
-
-                  runtime_session_id = response.get('runtimeSessionId', '')
-                  content_type = response.get('contentType', '')
-
-                  # Collect the streamed response
-                  result_lines = []
-                  if 'text/event-stream' in content_type:
-                      for line in response['response'].iter_lines(chunk_size=1):
-                          if line:
-                              decoded = line.decode('utf-8')
-                              result_lines.append(decoded)
-                  else:
-                      for event_chunk in response.get('response', []):
-                          result_lines.append(event_chunk.decode('utf-8'))
-
-                  # Return as SSE stream for the frontend
-                  sse_body = '\n'.join(result_lines) + '\n'
-
-                  return {
-                      'statusCode': 200,
-                      'headers': {
-                          'Content-Type': 'text/event-stream',
-                          'Cache-Control': 'no-cache',
-                          'Access-Control-Allow-Origin': '*',
-                          'Access-Control-Allow-Headers': 'Content-Type',
-                          'X-Runtime-Session-Id': runtime_session_id,
-                      },
-                      'body': sse_body,
-                  }
-              except Exception as e:
-                  error_event = f'data: {json.dumps({"type": "RUN_ERROR", "error": {"code": "PROXY_ERROR", "message": str(e)}})}\n\n'
-                  return {
-                      'statusCode': 200,
-                      'headers': {
-                          'Content-Type': 'text/event-stream',
-                          'Access-Control-Allow-Origin': '*',
-                      },
-                      'body': error_event,
-                  }
-
-  # ─── API Gateway (HTTP API) ────────────────────────────────────────────────
-  HttpApi:
-    Type: AWS::ApiGatewayV2::Api
+  # Function URL with response streaming. CloudFront is the only intended
+  # caller; access is enforced by CloudFront IP allowlist function (no OAC/IAM auth).
+  ProxyLambdaUrl:
+    Type: AWS::Lambda::Url
     Properties:
-      Name: !Sub '${EnvironmentName}-api'
-      ProtocolType: HTTP
-      CorsConfiguration:
+      TargetFunctionArn: !GetAtt ProxyLambda.Arn
+      AuthType: NONE
+      InvokeMode: RESPONSE_STREAM
+      Cors:
         AllowOrigins: ['*']
-        AllowMethods: [POST, OPTIONS]
-        AllowHeaders: [Content-Type]
+        AllowMethods: [POST]
+        AllowHeaders: ['Content-Type']
 
-  HttpApiIntegration:
-    Type: AWS::ApiGatewayV2::Integration
-    Properties:
-      ApiId: !Ref HttpApi
-      IntegrationType: AWS_PROXY
-      IntegrationUri: !GetAtt ProxyLambda.Arn
-      PayloadFormatVersion: '2.0'
+  # Note: OAC removed for Lambda Function URLs due to signature compatibility issues.
+  # Security is enforced by CloudFront IP allowlist function instead.
 
-  HttpApiRoute:
-    Type: AWS::ApiGatewayV2::Route
+  # ─── CloudFront Origin Request Policy (no Accept-Encoding forwarded) ──────
+  # The managed AllViewerExceptHostHeader policy forwards Accept-Encoding from
+  # the viewer, which lets the origin decide to gzip — and gzipped responses
+  # are buffered by CloudFront, breaking SSE. This custom policy forwards only
+  # the headers the proxy actually needs (Content-Type for the body parser).
+  ProxyOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
     Properties:
-      ApiId: !Ref HttpApi
-      RouteKey: 'POST /invocations'
-      Target: !Sub 'integrations/${HttpApiIntegration}'
+      OriginRequestPolicyConfig:
+        Name: !Sub '${EnvironmentName}-proxy-origin-req'
+        Comment: !Sub 'Forwards only Content-Type to ${EnvironmentName} proxy. No Accept-Encoding so origin does not gzip (would break SSE).'
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers: ['Content-Type']
+        QueryStringsConfig:
+          QueryStringBehavior: none
+        CookiesConfig:
+          CookieBehavior: none
 
-  HttpApiStage:
-    Type: AWS::ApiGatewayV2::Stage
-    Properties:
-      ApiId: !Ref HttpApi
-      StageName: '$default'
-      AutoDeploy: true
-
-  LambdaApiPermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref ProxyLambda
-      Action: lambda:InvokeFunction
-      Principal: apigateway.amazonaws.com
-      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
+  # ─── (API Gateway removed; the Lambda Function URL above is the entry point) ──
 
   # ─── S3 Buckets ─────────────────────────────────────────────────────────────
   LoggingBucket:
@@ -481,10 +420,15 @@ Resources:
               OriginAccessIdentity: ''
             OriginAccessControlId: !GetAtt CloudFrontOAC.Id
           - Id: ApiOrigin
-            DomainName: !Sub '${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+            # Lambda Function URL: extract domain without https:// prefix or trailing /
+            DomainName: !Select [2, !Split ['/', !GetAtt ProxyLambdaUrl.FunctionUrl]]
             CustomOriginConfig:
               HTTPSPort: 443
               OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              # Don't cap timeouts artificially low — agent runs can take 30+ seconds
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 60
         DefaultCacheBehavior:
           TargetOriginId: S3Origin
           ViewerProtocolPolicy: redirect-to-https
@@ -501,7 +445,8 @@ Resources:
             ViewerProtocolPolicy: redirect-to-https
             AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
             CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
-            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            OriginRequestPolicyId: !Ref ProxyOriginRequestPolicy
+            Compress: false
             FunctionAssociations:
               - EventType: viewer-request
                 FunctionARN: !GetAtt IPAllowlistFunction.FunctionARN
@@ -520,9 +465,9 @@ Outputs:
   AgentCoreRoleArn:
     Description: AgentCore Runtime IAM role ARN
     Value: !GetAtt AgentCoreRuntimeRole.Arn
-  ApiGatewayUrl:
-    Description: API Gateway URL for the proxy
-    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  ProxyFunctionUrl:
+    Description: Lambda Function URL for the streaming proxy (CloudFront forwards /invocations to this)
+    Value: !GetAtt ProxyLambdaUrl.FunctionUrl
   FrontendUrl:
     Description: CloudFront URL (HTTPS)
     Value: !Sub 'https://${CloudFrontDistribution.DomainName}'

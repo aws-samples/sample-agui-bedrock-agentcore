@@ -1,0 +1,7 @@
+*.ipynb  filter=maskaccountid
+*.md     filter=maskaccountid
+*.py     filter=maskaccountid
+*.yaml   filter=maskaccountid
+*.yml    filter=maskaccountid
+*.json   filter=maskaccountid
+*.sh     filter=maskaccountid

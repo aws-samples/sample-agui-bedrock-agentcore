@@ -272,8 +272,8 @@
     <h1>AG-UI Sample</h1>
     <div style="display:flex;gap:12px;align-items:center;">
         <div class="transport-toggle">
-            <button id="btn-sse" class="active" onclick="setTransport('sse')">SSE</button>
-            <button id="btn-ws" onclick="setTransport('ws')">WebSocket</button>
+            <button id="btn-sse" onclick="setTransport('sse')">SSE</button>
+            <button id="btn-ws" class="active" onclick="setTransport('ws')">WebSocket</button>
         </div>
         <div id="status" class="status connected">idle</div>
     </div>
@@ -307,8 +307,10 @@
 
 <script>
 // ─── Config ─────────────────────────────────────────────────────────────────
-const API_BASE = window.location.origin;
-let transport = 'sse';
+// API_BASE and WS_URL are injected at deploy time; fall back to same-origin for local dev
+const API_BASE = window.__API_BASE || window.location.origin;
+const WS_URL = window.__WS_URL || `${window.location.origin.replace('http', 'ws')}/ws`;
+let transport = 'ws';
 let ws = null;
 let threadId = null;
 let eventCount = 0;
@@ -330,7 +332,7 @@ function setTransport(t) {
 
 function connectWebSocket() {
     if (ws) ws.close();
-    ws = new WebSocket(`${API_BASE.replace('http', 'ws')}/ws`);
+    ws = new WebSocket(WS_URL);
     ws.onopen = () => setStatus('connected', 'ws connected');
     ws.onmessage = (e) => handleEvent(JSON.parse(e.data));
     ws.onclose = () => setStatus('error', 'ws disconnected');
@@ -626,6 +628,9 @@ function scrollMessages() {
 function escapeHtml(s) {
     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
+
+// Auto-connect WebSocket on page load
+if (transport === 'ws') connectWebSocket();
 </script>
 </body>
 </html>

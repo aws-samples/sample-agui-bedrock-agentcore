@@ -1,8 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   AG-UI Sample - AgentCore proxy + S3/CloudFront frontend.
-  Creates: Lambda proxy (SigV4 to AgentCore), API Gateway, S3 bucket with
-  index.html, CloudFront with OAC, ECR repo, and AgentCore IAM role.
+  Creates: Lambda proxy, WebSocket API Gateway, HTTP API Gateway,
+  S3 bucket with index.html, CloudFront with OAC, ECR repo, and AgentCore IAM role.
 
 Parameters:
   EnvironmentName:
@@ -134,7 +134,7 @@ Resources:
             Action: [ecr:GetDownloadUrlForLayer, ecr:BatchGetImage, ecr:GetAuthorizationToken]
             Resource: '*'
 
-  # ─── Lambda Proxy (Browser -> Lambda -> AgentCore with SigV4) ──────────────
+  # ─── Lambda Proxy ──────────────────────────────────────────────────────────
   ProxyLambdaRole:
     Type: AWS::IAM::Role
     Properties:
@@ -168,6 +168,9 @@ Resources:
           - Effect: Allow
             Action: [kms:Decrypt, kms:GenerateDataKey]
             Resource: !GetAtt EncryptionKey.Arn
+          - Effect: Allow
+            Action: execute-api:ManageConnections
+            Resource: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
 
   ProxyDLQ:
     Type: AWS::SQS::Queue
@@ -200,42 +203,108 @@ Resources:
         S3Bucket: !Ref ProxyAssetBucketParam
         S3Key: !Ref ProxyAssetKeyParam
 
-  # Function URL with response streaming. CloudFront is the only intended
-  # caller; access is enforced by CloudFront IP allowlist function (no OAC/IAM auth).
-  ProxyLambdaUrl:
-    Type: AWS::Lambda::Url
+  # ─── WebSocket API Gateway ─────────────────────────────────────────────────
+  WebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
     Properties:
-      TargetFunctionArn: !GetAtt ProxyLambda.Arn
-      AuthType: NONE
-      InvokeMode: RESPONSE_STREAM
-      Cors:
+      Name: !Sub '${EnvironmentName}-ws'
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: '$request.body.action'
+      Tags:
+        project: !Ref EnvironmentName
+
+  WebSocketConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $connect
+      AuthorizationType: NONE
+      Target: !Sub 'integrations/${WebSocketIntegration}'
+
+  WebSocketDisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $disconnect
+      Target: !Sub 'integrations/${WebSocketIntegration}'
+
+  WebSocketDefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $default
+      Target: !Sub 'integrations/${WebSocketIntegration}'
+
+  WebSocketIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProxyLambda.Arn}/invocations'
+
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WebSocketApi
+      StageName: prod
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 100
+
+  WebSocketLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ProxyLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+
+  # ─── HTTP API Gateway (for SSE /invocations) ───────────────────────────────
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${EnvironmentName}-http'
+      ProtocolType: HTTP
+      CorsConfiguration:
         AllowOrigins: ['*']
-        AllowMethods: [POST]
+        AllowMethods: [POST, OPTIONS]
         AllowHeaders: ['Content-Type']
+      Tags:
+        project: !Ref EnvironmentName
 
-  # Note: OAC removed for Lambda Function URLs due to signature compatibility issues.
-  # Security is enforced by CloudFront IP allowlist function instead.
-
-  # ─── CloudFront Origin Request Policy (no Accept-Encoding forwarded) ──────
-  # The managed AllViewerExceptHostHeader policy forwards Accept-Encoding from
-  # the viewer, which lets the origin decide to gzip — and gzipped responses
-  # are buffered by CloudFront, breaking SSE. This custom policy forwards only
-  # the headers the proxy actually needs (Content-Type for the body parser).
-  ProxyOriginRequestPolicy:
-    Type: AWS::CloudFront::OriginRequestPolicy
+  HttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
     Properties:
-      OriginRequestPolicyConfig:
-        Name: !Sub '${EnvironmentName}-proxy-origin-req'
-        Comment: !Sub 'Forwards only Content-Type to ${EnvironmentName} proxy. No Accept-Encoding so origin does not gzip (would break SSE).'
-        HeadersConfig:
-          HeaderBehavior: whitelist
-          Headers: ['Content-Type']
-        QueryStringsConfig:
-          QueryStringBehavior: none
-        CookiesConfig:
-          CookieBehavior: none
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ProxyLambda.Arn
+      PayloadFormatVersion: '2.0'
 
-  # ─── (API Gateway removed; the Lambda Function URL above is the entry point) ──
+  HttpApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /invocations'
+      Target: !Sub 'integrations/${HttpApiIntegration}'
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 100
+
+  HttpApiLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ProxyLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
 
   # ─── S3 Buckets ─────────────────────────────────────────────────────────────
   LoggingBucket:
@@ -419,16 +488,6 @@ Resources:
             S3OriginConfig:
               OriginAccessIdentity: ''
             OriginAccessControlId: !GetAtt CloudFrontOAC.Id
-          - Id: ApiOrigin
-            # Lambda Function URL: extract domain without https:// prefix or trailing /
-            DomainName: !Select [2, !Split ['/', !GetAtt ProxyLambdaUrl.FunctionUrl]]
-            CustomOriginConfig:
-              HTTPSPort: 443
-              OriginProtocolPolicy: https-only
-              OriginSSLProtocols: [TLSv1.2]
-              # Don't cap timeouts artificially low — agent runs can take 30+ seconds
-              OriginReadTimeout: 60
-              OriginKeepaliveTimeout: 60
         DefaultCacheBehavior:
           TargetOriginId: S3Origin
           ViewerProtocolPolicy: redirect-to-https
@@ -439,17 +498,6 @@ Resources:
           FunctionAssociations:
             - EventType: viewer-request
               FunctionARN: !GetAtt IPAllowlistFunction.FunctionARN
-        CacheBehaviors:
-          - PathPattern: /invocations
-            TargetOriginId: ApiOrigin
-            ViewerProtocolPolicy: redirect-to-https
-            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
-            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
-            OriginRequestPolicyId: !Ref ProxyOriginRequestPolicy
-            Compress: false
-            FunctionAssociations:
-              - EventType: viewer-request
-                FunctionARN: !GetAtt IPAllowlistFunction.FunctionARN
         CustomErrorResponses:
           - ErrorCode: 404
             ResponseCode: 200
@@ -465,9 +513,12 @@ Outputs:
   AgentCoreRoleArn:
     Description: AgentCore Runtime IAM role ARN
     Value: !GetAtt AgentCoreRuntimeRole.Arn
-  ProxyFunctionUrl:
-    Description: Lambda Function URL for the streaming proxy (CloudFront forwards /invocations to this)
-    Value: !GetAtt ProxyLambdaUrl.FunctionUrl
+  WebSocketUrl:
+    Description: WebSocket API URL
+    Value: !Sub 'wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+  HttpApiUrl:
+    Description: HTTP API URL for SSE invocations
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
   FrontendUrl:
     Description: CloudFront URL (HTTPS)
     Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
